@@ -49,6 +49,8 @@
 #define DEFAULT_SOFT_LIMIT (40UL << 20)
 #define DEFAULT_HARD_LIMIT (64UL << 20)
 
+static volatile sig_atomic_t g_should_stop = 0;
+
 typedef enum {
     CMD_SUPERVISOR = 0,
     CMD_START,
@@ -75,6 +77,7 @@ typedef struct container_record {
     unsigned long hard_limit_bytes;
     int exit_code;
     int exit_signal;
+    int stop_requested;
     char log_path[PATH_MAX];
     struct container_record *next;
 } container_record_t;
@@ -479,7 +482,12 @@ static void *container_waiter(void *arg)
     waitpid(w->pid, &status, 0);
     
     pthread_mutex_lock(w->lock);
-    w->record->state = CONTAINER_EXITED;
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL && !w->record->stop_requested)
+        w->record->state = CONTAINER_KILLED;
+    else if (w->record->stop_requested)
+        w->record->state = CONTAINER_STOPPED;
+    else
+        w->record->state = CONTAINER_EXITED;
     if (WIFEXITED(status))
         w->record->exit_code = WEXITSTATUS(status);
     else if (WIFSIGNALED(status))
@@ -488,6 +496,12 @@ static void *container_waiter(void *arg)
     
     free(w);
     return NULL;
+}
+
+static void signal_handler(int sig)
+{
+    (void)sig;
+    g_should_stop = 1;
 }
 
 static int run_supervisor(const char *rootfs)
@@ -513,6 +527,16 @@ static int run_supervisor(const char *rootfs)
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
     }
+
+    rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx.log_buffer);
+    if (rc != 0) {
+        perror("pthread_create logger");
+        return 1;
+    }
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGCHLD, SIG_DFL);
 
     // 1. Open kernel monitor device
     ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
@@ -553,7 +577,7 @@ static int run_supervisor(const char *rootfs)
     fflush(stdout);
 
     // 4. Event loop - accept CLI connections
-    while (!ctx.should_stop) {
+    while (!ctx.should_stop && !g_should_stop) {
         int client_fd;
         control_request_t req;
         control_response_t resp;
@@ -641,6 +665,7 @@ static int run_supervisor(const char *rootfs)
             container_record_t *c = ctx.containers;
             while (c) {
                 if (strcmp(c->id, req.container_id) == 0) {
+                    c->stop_requested = 1;
                     kill(c->host_pid, SIGTERM);
                     c->state = CONTAINER_STOPPED;
                     snprintf(resp.message, sizeof(resp.message),
@@ -659,7 +684,7 @@ static int run_supervisor(const char *rootfs)
             continue;
         }
 
-        if (req.kind == CMD_START || req.kind == CMD_RUN) {
+        if (req.kind == CMD_START) {
             // Allocate stack for clone
             char *stack = malloc(STACK_SIZE);
             if (!stack) {
@@ -771,14 +796,114 @@ static int run_supervisor(const char *rootfs)
             pthread_t waiter;
             pthread_create(&waiter, NULL, container_waiter, warg);
             pthread_detach(waiter);
-            pthread_mutex_lock(&ctx.metadata_lock);
-            record->state = CONTAINER_EXITED;
-            pthread_mutex_unlock(&ctx.metadata_lock);
             free(stack);
             free(cfg);
             continue;
         }
 
+        if (req.kind == CMD_RUN) {
+            char *stack = malloc(STACK_SIZE);
+            if (!stack) {
+                snprintf(resp.message, sizeof(resp.message), "Out of memory\n");
+                resp.status = -1;
+                write(client_fd, &resp, sizeof(resp));
+                close(client_fd);
+                continue;
+            }
+
+            child_config_t *cfg = malloc(sizeof(child_config_t));
+            memset(cfg, 0, sizeof(*cfg));
+            strncpy(cfg->id, req.container_id, sizeof(cfg->id) - 1);
+            strncpy(cfg->rootfs, req.rootfs, sizeof(cfg->rootfs) - 1);
+            strncpy(cfg->command, req.command, sizeof(cfg->command) - 1);
+            cfg->nice_value = req.nice_value;
+
+            container_record_t *record = malloc(sizeof(container_record_t));
+            memset(record, 0, sizeof(*record));
+            strncpy(record->id, req.container_id, sizeof(record->id) - 1);
+            snprintf(record->log_path, sizeof(record->log_path),
+                    "%s/%s.log", LOG_DIR, req.container_id);
+            record->soft_limit_bytes = req.soft_limit_bytes;
+            record->hard_limit_bytes = req.hard_limit_bytes;
+            record->state = CONTAINER_STARTING;
+            record->started_at = time(NULL);
+
+            int pipefd[2];
+            pipe(pipefd);
+            cfg->log_write_fd = pipefd[1];
+
+            pid_t pid = clone(child_fn, stack + STACK_SIZE,
+                            CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                            cfg);
+            if (pid < 0) {
+                perror("clone");
+                free(stack); free(cfg); free(record);
+                close(pipefd[0]); close(pipefd[1]);
+                snprintf(resp.message, sizeof(resp.message), "Failed\n");
+                resp.status = -1;
+                write(client_fd, &resp, sizeof(resp));
+                close(client_fd);
+                continue;
+            }
+
+            close(pipefd[1]);
+            record->host_pid = pid;
+            record->state = CONTAINER_RUNNING;
+
+            pthread_mutex_lock(&ctx.metadata_lock);
+            record->next = ctx.containers;
+            ctx.containers = record;
+            pthread_mutex_unlock(&ctx.metadata_lock);
+
+            if (ctx.monitor_fd >= 0)
+                register_with_monitor(ctx.monitor_fd, req.container_id,
+                                    pid, req.soft_limit_bytes,
+                                    req.hard_limit_bytes);
+
+            // Acknowledge start to client
+            snprintf(resp.message, sizeof(resp.message),
+                    "Running container %s pid=%d\n", req.container_id, pid);
+            resp.status = 0;
+            write(client_fd, &resp, sizeof(resp));
+
+            // Read logs synchronously
+            int log_fd = open(record->log_path,
+                            O_WRONLY | O_CREAT | O_APPEND, 0644);
+            char buf[4096];
+            ssize_t n;
+            while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+                if (log_fd >= 0) write(log_fd, buf, n);
+            if (log_fd >= 0) close(log_fd);
+            close(pipefd[0]);
+
+            int status;
+            waitpid(pid, &status, 0);
+
+            pthread_mutex_lock(&ctx.metadata_lock);
+            if (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL && !record->stop_requested)
+                record->state = CONTAINER_KILLED;
+            else if (record->stop_requested)
+                record->state = CONTAINER_STOPPED;
+            else
+                record->state = CONTAINER_EXITED;
+            if (WIFEXITED(status))
+                record->exit_code = WEXITSTATUS(status);
+            else if (WIFSIGNALED(status))
+                record->exit_signal = WTERMSIG(status);
+            pthread_mutex_unlock(&ctx.metadata_lock);
+
+            // Send final status to client
+            memset(&resp, 0, sizeof(resp));
+            resp.status = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+            snprintf(resp.message, sizeof(resp.message),
+                    "Container %s exited with status %d\n",
+                    req.container_id, resp.status);
+            write(client_fd, &resp, sizeof(resp));
+            close(client_fd);
+            free(stack); free(cfg);
+            continue;
+        }
+        
         // Unknown command
         snprintf(resp.message, sizeof(resp.message), "Unknown command\n");
         resp.status = -1;
@@ -793,6 +918,7 @@ static int run_supervisor(const char *rootfs)
     if (ctx.monitor_fd >= 0)
         close(ctx.monitor_fd);
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
+    pthread_join(ctx.logger_thread, NULL);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
     return 0;

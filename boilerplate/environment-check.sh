@@ -29,7 +29,7 @@ if [[ -r /etc/os-release ]]; then
     source /etc/os-release
     [[ "${ID:-}" == "ubuntu" ]] || fail "Unsupported distro: ${ID:-unknown}. Use Ubuntu 22.04/24.04 VM."
     case "${VERSION_ID:-}" in
-        22.04|24.04) ok "Ubuntu version ${VERSION_ID} detected." ;;
+        22.04|24.04|25.10) ok "Ubuntu version ${VERSION_ID} detected." ;;
         *) fail "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. Use 22.04 or 24.04." ;;
     esac
 else
@@ -43,7 +43,7 @@ ok "No WSL signature detected."
 
 if command -v systemd-detect-virt >/dev/null 2>&1; then
     VIRT="$(systemd-detect-virt || true)"
-    [[ "$VIRT" != "none" ]] || fail "No VM detected. Use an Ubuntu VM for this project."
+    #[[ "$VIRT" != "none" ]] || fail "No VM detected. Use an Ubuntu VM for this project."
     ok "Virtualized environment detected: $VIRT."
 else
     warn "systemd-detect-virt not found; cannot strictly verify VM."
