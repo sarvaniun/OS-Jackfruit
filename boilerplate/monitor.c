@@ -276,7 +276,7 @@ static int __init monitor_init(void)
 /* --- Provided: Module Exit --- */
 static void __exit monitor_exit(void)
 {
-    timer_delete_sync(&monitor_timer);
+    del_timer_sync(&monitor_timer);
 struct monitored_entry *entry, *tmp;
 mutex_lock(&monitor_mutex);
 list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
